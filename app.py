@@ -1,43 +1,85 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import google.generativeai as genai
+from datetime import datetime, date
+import numpy as np
 
 # ==========================================
-# 1. 基礎設定 (只保留最必要的 CSS)
+# 1. 視覺設定：純白簡約風格 (Light Mode)
 # ==========================================
-st.set_page_config(page_title="個人美股投資管理", layout="wide", page_icon="📈")
+st.set_page_config(page_title="個人美股資產管理 (Light)", layout="wide", page_icon="📊")
 
-# 僅調整背景色，不強制修改元件結構，確保穩定性
 st.markdown("""
     <style>
+    /* --- 全局背景：純白 --- */
     .stApp {
-        background-color: #0e1117;
+        background-color: #ffffff;
     }
-    h1, h2, h3, p, div, span, label {
-        color: #e0e0e0 !important;
+    
+    /* --- 文字顏色：深灰/黑 (高對比) --- */
+    h1, h2, h3, h4, h5, h6 {
+        color: #1f2937 !important; /* 深灰 */
+        font-weight: 700 !important;
     }
-    /* 讓 Metric 數值更明顯 */
-    [data-testid="stMetricValue"] {
-        color: #4facfe !important;
+    p, div, span, label, li {
+        color: #374151 !important; /* 次深灰 */
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
     }
-    /* 側邊欄微調 */
+    
+    /* --- 側邊欄：淺灰底 --- */
     [data-testid="stSidebar"] {
-        background-color: #161b22;
+        background-color: #f3f4f6 !important;
+        border-right: 1px solid #e5e7eb;
+    }
+    
+    /* --- Metric 指標卡片 --- */
+    div[data-testid="stMetric"] {
+        background-color: #f9fafb; /* 非常淺的灰 */
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 15px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    [data-testid="stMetricLabel"] {
+        color: #6b7280 !important; /* 標籤淺灰 */
+    }
+    [data-testid="stMetricValue"] {
+        color: #111827 !important; /* 數值純黑 */
+        font-weight: 800 !important;
+    }
+    
+    /* --- 表格優化 (白底黑字) --- */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e5e7eb;
+    }
+    
+    /* --- 按鈕風格 (藍色強調) --- */
+    .stButton > button {
+        background-color: #2563eb !important; /* 亮藍 */
+        color: white !important;
+        border: none !important;
+        border-radius: 6px;
+    }
+    .stButton > button:hover {
+        background-color: #1d4ed8 !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 核心數據邏輯 (最穩定的 Session State)
+# 2. 核心邏輯與計算
 # ==========================================
+
+# 初始化 Session State
 if 'portfolio' not in st.session_state:
-    # 預設範例資料
+    # 預設資料 (包含買入日期，用於計算年化)
     st.session_state['portfolio'] = pd.DataFrame([
-        {'Ticker': 'NVDA', 'Cost': 450.0, 'Shares': 10},
-        {'Ticker': 'AAPL', 'Cost': 175.0, 'Shares': 20},
-        {'Ticker': 'TSLA', 'Cost': 200.0, 'Shares': 15}
+        {'Ticker': 'NVDA', 'Cost': 450.0, 'Shares': 10, 'Date': date(2023, 1, 15)},
+        {'Ticker': 'AAPL', 'Cost': 170.0, 'Shares': 20, 'Date': date(2023, 6, 1)},
+        {'Ticker': 'TSLA', 'Cost': 200.0, 'Shares': 15, 'Date': date(2022, 11, 20)}
     ])
 
 if 'cash' not in st.session_state:
@@ -46,86 +88,124 @@ if 'cash' not in st.session_state:
 if 'gemini_api_key' not in st.session_state:
     st.session_state['gemini_api_key'] = ""
 
+# 年化報酬率計算函數 (CAGR)
+def calculate_cagr(end_price, start_price, start_date):
+    if start_price == 0: return 0
+    days_held = (date.today() - start_date).days
+    if days_held <= 0: return 0
+    years = days_held / 365.25
+    
+    # 如果持有不到一年，直接顯示簡單報酬率，避免年化數值過於誇張
+    if years < 1:
+        return (end_price - start_price) / start_price
+    
+    try:
+        cagr = (end_price / start_price) ** (1 / years) - 1
+        return cagr
+    except:
+        return 0
+
 # ==========================================
-# 3. 側邊欄：最純粹的輸入介面
+# 3. 側邊欄：輸入區
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 投資設定")
+    st.header("⚙️ 設定與交易")
     
     # API Key
     api_key = st.text_input("Gemini API Key (選填)", value=st.session_state['gemini_api_key'], type="password")
     if api_key: st.session_state['gemini_api_key'] = api_key
     
-    st.divider()
-    
-    # 現金管理
-    st.subheader("💰 現金管理")
-    new_cash = st.number_input("目前現金餘額 (USD)", value=st.session_state['cash'], step=100.0)
+    st.markdown("---")
+    st.subheader("💵 現金管理")
+    new_cash = st.number_input("現金餘額 (USD)", value=st.session_state['cash'], step=100.0)
     if new_cash != st.session_state['cash']:
         st.session_state['cash'] = new_cash
         st.rerun()
-    
-    st.divider()
-
-    # 新增持倉
-    st.subheader("➕ 新增/更新持倉")
-    with st.form("add_position"):
-        ticker_in = st.text_input("股票代號 (例如 NVDA)").upper()
-        cost_in = st.number_input("平均成本", min_value=0.0, step=0.1)
-        shares_in = st.number_input("持有股數", min_value=0.0, step=1.0)
         
-        submitted = st.form_submit_button("確認送出")
-        if submitted and ticker_in and shares_in > 0:
-            # 邏輯：有就更新，沒有就新增
-            df = st.session_state['portfolio']
-            new_data = {'Ticker': ticker_in, 'Cost': cost_in, 'Shares': shares_in}
-            
-            if ticker_in in df['Ticker'].values:
-                df.loc[df['Ticker'] == ticker_in, ['Cost', 'Shares']] = [cost_in, shares_in]
-                st.success(f"已更新 {ticker_in}")
-            else:
-                st.session_state['portfolio'] = pd.concat([df, pd.DataFrame([new_data])], ignore_index=True)
-                st.success(f"已新增 {ticker_in}")
-            st.rerun()
+    st.markdown("---")
+    st.subheader("➕ 新增/更新持倉")
+    
+    with st.form("add_pos"):
+        t_in = st.text_input("股票代號").upper()
+        c_in = st.number_input("平均成本", min_value=0.0, step=0.1)
+        s_in = st.number_input("持有股數", min_value=0.0, step=1.0)
+        d_in = st.date_input("買入日期 (用於算年化)", value=date.today())
+        
+        if st.form_submit_button("確認送出"):
+            if t_in and s_in > 0:
+                df = st.session_state['portfolio']
+                new_row = {'Ticker': t_in, 'Cost': c_in, 'Shares': s_in, 'Date': d_in}
+                
+                # 如果已存在，更新資料 (包含日期)
+                if t_in in df['Ticker'].values:
+                    # 更新該行的所有欄位
+                    df.loc[df['Ticker'] == t_in, ['Cost', 'Shares', 'Date']] = [c_in, s_in, d_in]
+                    st.success(f"已更新 {t_in}")
+                else:
+                    st.session_state['portfolio'] = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                    st.success(f"已新增 {t_in}")
+                st.rerun()
 
-    # 刪除功能
+    # 刪除區塊
     if not st.session_state['portfolio'].empty:
-        st.divider()
-        to_del = st.selectbox("刪除股票", st.session_state['portfolio']['Ticker'].unique())
-        if st.button("刪除選定項目"):
+        st.markdown("---")
+        to_del = st.selectbox("選擇刪除", st.session_state['portfolio']['Ticker'].unique())
+        if st.button("🗑️ 刪除"):
             st.session_state['portfolio'] = st.session_state['portfolio'][st.session_state['portfolio']['Ticker'] != to_del]
             st.rerun()
 
 # ==========================================
-# 4. 主畫面：直接顯示數據，不搞花俏導航
+# 4. 主畫面：白底高對比
 # ==========================================
-st.title("📊 個人美股資產總覽")
+st.title("📈 個人美股資產總覽")
+st.caption(f"最後更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# --- 數據計算區 ---
+# --- 數據處理與計算 ---
 df = st.session_state['portfolio'].copy()
-if not df.empty:
-    # 批量獲取現價 (最快最穩的方法)
-    ticker_list = df['Ticker'].tolist()
-    try:
-        if len(ticker_list) == 1:
-            stock = yf.Ticker(ticker_list[0])
-            current_price = stock.history(period='1d')['Close'].iloc[-1]
-            price_map = {ticker_list[0]: current_price}
-        else:
-            data = yf.download(ticker_list, period="1d", progress=False)['Close']
-            price_map = data.iloc[-1].to_dict()
-    except:
-        price_map = {} # 避免報錯
-        st.error("無法連接 Yahoo Finance，顯示持倉成本。")
+total_assets_history = pd.DataFrame() # 用於畫圖
 
-    # 映射價格
-    df['Current Price'] = df['Ticker'].map(price_map).fillna(df['Cost']) # 若抓不到就用成本價暫代
-    df['Market Value'] = df['Current Price'] * df['Shares']
-    df['Profit'] = (df['Current Price'] - df['Cost']) * df['Shares']
-    df['Return %'] = (df['Profit'] / (df['Cost'] * df['Shares']) * 100).fillna(0)
+if not df.empty:
+    tickers = df['Ticker'].tolist()
     
+    # 1. 獲取現價
+    try:
+        # 下載過去一年的數據，用於畫資產走勢圖
+        hist_data = yf.download(tickers, period="1y", progress=False)['Close']
+        
+        # 處理單支股票與多支股票的格式差異
+        current_prices = {}
+        if isinstance(hist_data, pd.DataFrame) and not hist_data.empty:
+            # 多支股票
+            for t in tickers:
+                if t in hist_data.columns:
+                    current_prices[t] = hist_data[t].iloc[-1]
+                else:
+                    current_prices[t] = 0
+            # 準備畫圖數據：計算每日總資產
+            # 邏輯：假設過去一年都持有這些股數 (這是簡易回測邏輯)
+            stock_history_val = (hist_data * df.set_index('Ticker')['Shares']).sum(axis=1)
+            total_assets_history = stock_history_val + st.session_state['cash']
+            
+        elif isinstance(hist_data, pd.Series):
+            # 單支股票
+            current_prices[tickers[0]] = hist_data.iloc[-1]
+            total_assets_history = (hist_data * df.iloc[0]['Shares']) + st.session_state['cash']
+            
+    except:
+        current_prices = {t: 0 for t in tickers}
+        st.error("⚠️ 數據連線異常，請稍後再試")
+
+    # 2. 整合數據
+    df['Current Price'] = df['Ticker'].map(current_prices)
+    df['Market Value'] = df['Current Price'] * df['Shares']
+    df['Total Profit'] = (df['Current Price'] - df['Cost']) * df['Shares']
+    df['Return %'] = (df['Total Profit'] / (df['Cost'] * df['Shares']) * 100)
+    
+    # 3. 計算年化報酬 (CAGR)
+    df['CAGR %'] = df.apply(lambda x: calculate_cagr(x['Current Price'], x['Cost'], x['Date']), axis=1) * 100
+
     total_stock_val = df['Market Value'].sum()
-    total_profit = df['Profit'].sum()
+    total_profit = df['Total Profit'].sum()
 else:
     total_stock_val = 0
     total_profit = 0
@@ -134,107 +214,107 @@ total_cash = st.session_state['cash']
 total_assets = total_stock_val + total_cash
 cash_ratio = (total_cash / total_assets * 100) if total_assets > 0 else 0
 
-# --- 儀表板 Metrics ---
+# --- A. 總資產折線圖 (放在最顯眼位置) ---
+# 如果有歷史數據，繪製圖表
+if not total_assets_history.empty:
+    st.subheader("💰 總資產歷史走勢 (模擬回測)")
+    
+    # 使用 Plotly 繪製
+    fig = px.area(
+        x=total_assets_history.index, 
+        y=total_assets_history.values,
+        labels={'x': '日期', 'y': '總資產 (USD)'},
+    )
+    
+    # 白底圖表設定
+    fig.update_layout(
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font_color='#374151',
+        xaxis=dict(showgrid=True, gridcolor='#f3f4f6'),
+        yaxis=dict(showgrid=True, gridcolor='#f3f4f6'),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=300
+    )
+    fig.update_traces(line_color='#2563eb', fill='tozeroy', fillcolor='rgba(37, 99, 235, 0.1)')
+    st.plotly_chart(fig, use_container_width=True)
+
+# --- B. 關鍵 Metrics ---
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("總資產 (Total Assets)", f"${total_assets:,.0f}")
-col2.metric("總損益 (P/L)", f"${total_profit:,.0f}", delta_color="normal")
-col3.metric("股票市值 (Stock Value)", f"${total_stock_val:,.0f}")
-col4.metric("現金水位 (Cash)", f"{cash_ratio:.1f}%")
+col2.metric("總損益 (Total P/L)", f"${total_profit:,.0f}", delta_color="normal")
+col3.metric("股票市值", f"${total_stock_val:,.0f}")
+col4.metric("現金水位", f"{cash_ratio:.1f}%")
 
-# --- 現金水位條 ---
-if cash_ratio < 10:
-    st.warning(f"⚠️ 現金水位偏低 ({cash_ratio:.1f}%)")
-else:
-    st.progress(min(cash_ratio/100, 1.0), text=f"目前現金佔比: {cash_ratio:.1f}%")
+# 現金條
+st.write(f"**現金佔比: {cash_ratio:.1f}%**")
+st.progress(min(cash_ratio/100, 1.0))
 
 st.divider()
 
-# --- 持倉表格 (乾淨、原生、好讀) ---
-st.subheader("📋 持倉明細")
+# --- C. 持倉明細 (新增年化報酬欄位) ---
+st.subheader("📋 持倉詳細績效")
+
 if not df.empty:
-    # 使用 Streamlit 原生表格設定，最穩定
+    # 格式化顯示
+    display_df = df.copy()
+    
+    # 使用 column_config 製作漂亮的表格
     st.dataframe(
-        df,
+        display_df,
         column_config={
             "Ticker": "代號",
-            "Cost": st.column_config.NumberColumn("平均成本", format="$%.2f"),
-            "Shares": st.column_config.NumberColumn("股數", format="%.0f"),
+            "Date": st.column_config.DateColumn("買入日期"),
+            "Cost": st.column_config.NumberColumn("成本價", format="$%.2f"),
             "Current Price": st.column_config.NumberColumn("現價", format="$%.2f"),
+            "Shares": st.column_config.NumberColumn("股數", format="%.0f"),
             "Market Value": st.column_config.NumberColumn("市值", format="$%.0f"),
-            "Profit": st.column_config.NumberColumn("損益", format="$%.0f"),
-            "Return %": st.column_config.NumberColumn("報酬率", format="%.2f%%"),
+            "Total Profit": st.column_config.NumberColumn("總損益", format="$%.0f"),
+            "Return %": st.column_config.NumberColumn("總報酬率", format="%.2f%%"),
+            "CAGR %": st.column_config.NumberColumn("年化報酬 (CAGR)", format="%.2f%%", help="根據持有天數計算的複利年化報酬"),
         },
         use_container_width=True,
         hide_index=True
     )
 else:
-    st.info("目前沒有持倉，請從左側新增。")
+    st.info("暫無持倉，請從左側側邊欄新增。")
 
-# --- 個股分析區塊 (直接選，不跳頁) ---
+# --- D. AI 顧問區 ---
 st.divider()
-st.subheader("📈 個股快速分析")
+st.subheader("🤖 AI 投資分析")
 
 if not df.empty:
-    selected_ticker = st.selectbox("選擇要查看的股票：", df['Ticker'].unique())
+    ticker_selected = st.selectbox("選擇要分析的股票", df['Ticker'].unique())
     
-    if selected_ticker:
-        col_k, col_info = st.columns([2, 1])
-        
-        # 獲取資料
-        stock = yf.Ticker(selected_ticker)
-        hist = stock.history(period="6mo")
-        info = stock.info
-        
-        with col_k:
-            # 簡單明瞭的 K 線圖
-            fig = go.Figure(data=[go.Candlestick(x=hist.index,
-                            open=hist['Open'], high=hist['High'],
-                            low=hist['Low'], close=hist['Close'], name="K線")])
-            fig.update_layout(title=f"{selected_ticker} 近半年走勢", xaxis_rangeslider_visible=False, height=400,
-                              template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with col_info:
-            st.markdown(f"### {selected_ticker}")
-            st.write(f"**產業：** {info.get('sector', 'N/A')}")
-            st.write(f"**本益比 (P/E)：** {info.get('trailingPE', 'N/A')}")
-            st.write(f"**52週高點：** ${info.get('fiftyTwoWeekHigh', 'N/A')}")
-            st.write(f"**分析師目標價：** ${info.get('targetMeanPrice', 'N/A')}")
-            
-            # AI 分析按鈕 (只有按下去才觸發，不自動觸發以免報錯)
-            if st.session_state['gemini_api_key']:
-                if st.button(f"🤖 AI 分析 {selected_ticker}"):
-                    with st.spinner("AI 正在思考..."):
-                        try:
-                            genai.configure(api_key=st.session_state['gemini_api_key'])
-                            model = genai.GenerativeModel('gemini-pro')
-                            prompt = f"請用繁體中文簡短分析美股 {selected_ticker} 的基本面與近期風險。"
-                            res = model.generate_content(prompt)
-                            st.info(res.text)
-                        except Exception as e:
-                            st.error(f"AI 分析失敗: {e}")
-
-# --- AI 投資建議 (可選) ---
-st.divider()
-with st.expander("✨ 投資組合 AI 總體建議 (點擊展開)"):
-    if st.button("生成投資建議報告"):
+    if st.button("生成分析與建議"):
         if not st.session_state['gemini_api_key']:
-            st.warning("請先在左側輸入 Gemini API Key")
+            st.warning("請先在側邊欄輸入 API Key")
         else:
-            with st.spinner("正在分析您的資產配置..."):
+            with st.spinner("AI 正在分析基本面與財報數據..."):
                 try:
                     genai.configure(api_key=st.session_state['gemini_api_key'])
                     model = genai.GenerativeModel('gemini-pro')
                     
-                    pf_csv = df.to_string()
+                    # 獲取該股數據
+                    stock_row = df[df['Ticker'] == ticker_selected].iloc[0]
                     prompt = f"""
-                    用戶總資產: {total_assets} USD
-                    現金水位: {cash_ratio:.1f}%
-                    持倉:
-                    {pf_csv}
-                    請給出 3 點具體的投資調整建議 (繁體中文)。
+                    請用繁體中文分析美股 {ticker_selected}。
+                    
+                    我的持倉狀況：
+                    - 成本: {stock_row['Cost']}
+                    - 現價: {stock_row['Current Price']}
+                    - 報酬率: {stock_row['Return %']:.2f}%
+                    - 持有時間: 從 {stock_row['Date']} 至今
+                    
+                    請提供：
+                    1. 短評目前該公司的基本面狀況。
+                    2. 針對我的獲利狀況，建議續抱還是獲利了結？
                     """
                     res = model.generate_content(prompt)
-                    st.markdown(res.text)
+                    st.markdown(f"""
+                    <div style="background-color:#f3f4f6; padding:20px; border-radius:10px; border-left:5px solid #2563eb;">
+                        {res.text}
+                    </div>
+                    """, unsafe_allow_html=True)
                 except Exception as e:
-                    st.error("分析失敗")
+                    st.error(f"分析失敗: {e}")
